@@ -8,9 +8,9 @@ detect.
 
 ## What this does
 
-- Registers a validated **Mpipi-GG** model in [COSMO](https://github.com/vuqv/cosmo)
-  by splicing parameter tables from [FINCHES](https://github.com/idptools/finches)
-  into COSMO's native `mpipi` model (with full self-validation — see below).
+- Builds a validated **Mpipi-GG** model from [COSMO](https://github.com/vuqv/cosmo)
+  + [FINCHES](https://github.com/idptools/finches) parameter tables (with full
+  self-validation — see below).
 - Generates per-replica random-coil starting structures (self-avoiding walk)
   and simulation inputs matching the Lotthammer 2024 / STARLING training
   protocol: NVT 300 K, 150 mM implicit salt, dt = 20 fs, 500 Å box,
@@ -21,6 +21,19 @@ detect.
 - Screens convergence with a monitor: Rg / R_e, per-label long-range
   ⟨r⁻⁶⟩ contact scores at the five Dedmon 2005 MTSL sites (Q24, S42, Q62,
   S87, N103), block drift, cross-replica spread.
+
+## Repository layout
+
+```
+setup_asyn_mpipigg.py   # setup + force-field self-validation + INI/PDB generation
+run_cosmo_mpipigg.py    # static runner: splices the validated GG tables, calls mdrun
+monitor.py              # convergence screening (safe on running trajectories)
+probe_restart.py        # two-leg probe of COSMO restart semantics (run once per build)
+```
+
+Generated at setup time (not tracked): `md_<arm>_<rep>_seg<seg>.ini`,
+`<arm>/rep*/asyn_*.pdb`, `mpipi_gg_params.pkl`, `mpipi_gg_delta.npz`,
+`versions.txt`.
 
 ## Requirements
 
@@ -33,53 +46,53 @@ detect.
 | mdtraj | conda-forge / pip | trajectory analysis (monitor) |
 | sparrow | pip (optional) | ALBATROSS Rg prediction for the sanity band |
 
-## Installation
-
 ```bash
-# 1. environment
 conda create -n mpipigg python=3.11 -y
 conda activate mpipigg
 conda install -c conda-forge openmm cudatoolkit mdtraj -y
-
-# 2. COSMO (GitHub only)
-git clone https://github.com/vuqv/cosmo.git
-cd cosmo && pip install -e . && cd ..
-
-# 3. FINCHES (GitHub only; note: requires numpy >= 2)
-pip install git+https://github.com/idptools/finches.git
-
-# 4. optional: ALBATROSS Rg prediction for the sanity band
-pip install sparrow
+git clone https://github.com/vuqv/cosmo.git && pip install -e ./cosmo
+pip install git+https://github.com/idptools/finches.git   # tested: 0.1.3 and current master (1.0.0); pin a commit for production
+pip install sparrow   # optional
 ```
 
-Verify GPU support once: `python -c "from openmm import Platform; \
-print(Platform.getPlatformByName('CUDA'))"` — should not raise.
+**Version compatibility.** Verified end-to-end on COSMO `2026.2.dev2` +
+FINCHES `1.0.0` + OpenMM `8.6.1`. The runner handles both COSMO entry
+points (`main` on older builds, `mdrun` on current). FINCHES pulls in
+`metapredict` (hence torch) at import time — install the full dependency
+chain; only the parameter tables are used here, but the import is eager.
 
 ## Usage
 
 ```bash
 # stage 1: pilot (also regenerates the validated parameter pickle)
 python setup_asyn_mpipigg.py --only pilot
-sbatch --array=1-1 submit_pilot.slurm
+python run_cosmo_mpipigg.py -f md_pilot_1_seg1.ini
 
-# stage 2: E2s (6 replicas, one GPU each)
+# stage 2: E2s (6 independent replicas; run them in parallel however
+# your site prefers — one GPU each)
 python setup_asyn_mpipigg.py --only E2s
-sbatch --array=1-6 submit_E2s.slurm
+for r in $(seq 1 6); do
+    python run_cosmo_mpipigg.py -f md_E2s_${r}_seg1.ini &
+done; wait
 
 # monitor anytime (safe on running trajectories)
 python monitor.py 'E2s/rep*/*'
 MONITOR_STRIDE=5 python monitor.py 'E2l/rep*/*'    # lower memory for long arms
 
 # later arms, in order, only after the gates below pass
-python setup_asyn_mpipigg.py --only E2m && sbatch --array=1-3 submit_E2m.slurm
-python setup_asyn_mpipigg.py --only E2l           # then, sequentially:
-sbatch --array=1-3 submit_E2l_seg1.slurm          #   seg N after seg N-1
-sbatch --array=1-3 submit_E2l_seg2.slurm
-# ... through seg10
+python setup_asyn_mpipigg.py --only E2m
+# E2l: segments are SEQUENTIAL per replica (seg N resumes seg N-1's checkpoint)
+for r in 1 2 3; do
+    for s in $(seq 1 10); do
+        python run_cosmo_mpipigg.py -f md_E2l_${r}_seg${s}.ini
+    done
+done
 ```
 
-**Adjust the conda environment name** in the generated `submit_*.slurm`
-templates if yours is not `myenv`.
+The INIs request `device = GPU`. For a CPU run (e.g. a local smoke test),
+set `device = CPU` and add `ppn = <cores>` (COSMO defaults to 1 thread).
+There is no GPU→CPU automatic fallback: a GPU INI on a GPU-less node fails
+at platform selection.
 
 ### Gates between arms
 
@@ -89,26 +102,34 @@ Proceed to the next arm only when the previous one shows, via
 1. small cross-replica `range/mean`, `CV`, and `|drift|` for the five
    LR(⟨r⁻⁶⟩) scores — *stationarity of the tail observable, not just Rg*;
 2. Rg inside the ALBATROSS Mpipi-GG band (set `RG_REFERENCE_AA` in
-   `monitor.py` from sparrow; this is a sanity check, not a pass/fail gate);
-3. (E2l only) the two standing verifications below.
+   `monitor.py` from sparrow; this is a sanity check, not a pass/fail gate).
 
-## Force-field self-validation
+## Force-field construction and self-validation
 
 `setup_asyn_mpipigg.py` refuses to run unless, at setup time:
 
 - σ, ν, μ, and rc reproduce COSMO's built-in `mpipi` (< 10⁻³ relative);
 - the **full 20×20 ε block** of FINCHES `Mpipi_original` reproduces COSMO's
   `mpipi` after unit scaling (mode A). Unit scales are auto-detected
-  (ε × 4.184, σ × 0.1 on the tested FINCHES 0.1.3) — never assumed;
+  (ε × 4.184, σ × 0.1 on tested FINCHES 0.1.3 and 1.0.0) — never assumed;
+  a neutral-only match with charged-pair mismatch (mode B, DH folded into
+  ε) aborts with a distinct message;
 - FINCHES `CHARGE_ALL` matches COSMO's per-residue charges (GG must not
   alter the charge set);
-- the `debye_length` registry entry is present and copied (otherwise the
-  salt concentration would silently default).
+- the `debye_length` registry entry for `mpipi` is present (0.795 nm at
+  150 mM) and is re-checked by the runner at run time.
 
-The GG-vs-base difference matrices are written to `mpipi_gg_delta.npz`
-(suitable for a supplementary information table), and the validated model is
-serialized to `mpipi_gg_params.pkl`, which compute nodes load in ~10 ms
-without re-running validation.
+**Why the GG tables are spliced in place.** COSMO dispatches force terms
+and per-residue atom types by the model *name*, hard-coding `'mpipi'` in
+three places (`models.py` per-residue and nonbonded dispatch,
+`addWangFrenkelForces`' assert, `setCAIDPerResidueType`'s table lookup).
+Registering a new `mpipi_gg` model name therefore builds no Wang-Frenkel
+force on unmodified COSMO (the run dies with `UnboundLocalError: nb_name`).
+Instead, `run_cosmo_mpipigg.py` **replaces** `parameters['mpipi']` with
+the validated GG entry before calling `mdrun`; the INI keeps
+`model = mpipi`, and provenance lives in `mpipi_gg_delta.npz`
+(GG-vs-base difference matrices, suitable for an SI table), the
+`*_runinfo.log` files, and `versions.txt`.
 
 ## Outputs (per replica, self-contained)
 
@@ -116,24 +137,27 @@ without re-running validation.
 E2s/rep1/
   asyn_E2s_rep1.pdb        # random-coil start (topology for the trajectory)
   asyn_E2s_rep1.dcd        # trajectory, 2 ns/frame, first 5 frames = discarded equilibration
+  asyn_E2s_rep1.chk/.log/_runinfo.log/_init.pdb/_final.pdb/.psf
   asyn_E2s_rep1.monitor.json
-monitor_summary.csv        # cross-replica screening table
+monitor_summary.csv        # cross-replica screening table (needs ≥2 finished replicas)
 versions.txt               # pinned software stack (recorded at setup)
 mpipi_gg_delta.npz         # GG vs base parameter differences
 ```
 
-## Standing verifications (read before E2l)
+## Verifications
 
-- **rc = 3σ convention for GG**: asserted exact for COSMO's built-in Mpipi,
-  *assumed* for GG — verify against the Lotthammer 2024 supplementary
-  information before submitting E2l.
-- **COSMO restart semantics**: E2l relies on `md_steps` being a cumulative
-  target on restart. Confirm on your COSMO build with the two-leg probe
-  (`probe/` pattern: leg 1 = 100k steps, leg 2 = 150k target → 15 frames
-  means cumulative, 25 means per-segment).
-- **`nstcomm`** (COM removal): recommended by COSMO for single chains; add
-  to the INI template once the key name is confirmed against your COSMO
-  version's docs.
+- **Restart semantics — verified.** COSMO treats `md_steps` as a
+  *cumulative* target on restart (`nsteps_remain = md_steps − done_steps`),
+  confirmed on `2026.2.dev2` both by code inspection and empirically by
+  `probe_restart.py` (60k + restart@120k → 12 frames, one appended DCD).
+  COSMO is a moving target: re-run `python probe_restart.py md_pilot_1_seg1.ini`
+  once on your build before launching E2l.
+- **rc = 3σ convention for GG**: asserted exact for COSMO's built-in Mpipi
+  and corroborated by FINCHES' own Wang-Frenkel reference energy
+  (`R_ij = 3·sigma_ij` hard-coded for the same tables). Still verify against
+  the Lotthammer 2024 supplementary information before E2l.
+- **`nstcomm`** (COM removal): supported by current COSMO (default off);
+  the INI sets `nstcomm = 100`. Delete the key if your build predates it.
 
 ## Protocol reference
 
@@ -153,3 +177,7 @@ PRE label sites per Dedmon et al., *JACS* 127, 476–477 (2005).
 - The monitor's ⟨r⁻⁶⟩ scores are Cα–Cα CG proxies for onset/convergence
   screening. Physical PRE back-calculation (backbone reconstruction + MTSL
   rotamer averaging, e.g. DEER-PREdict) is a downstream step.
+- The ladder table (`ARMS` in `setup_asyn_mpipigg.py`) is the single source
+  of truth for arm lengths/replica counts — note the pre-cov design doc
+  (Sept 2026) lists E2l as 6 replicas and drops E2m; reconcile before the
+  campaign.
