@@ -146,6 +146,21 @@ mpipi_gg_delta.npz         # GG vs base parameter differences
 
 ## Verifications
 
+- **PDB output is mdtraj-parseable — verified.** `write_random_coil_pdb`
+  writes strict fixed-column PDB (atom name cols 13–16, resName 18–20,
+  chainID 22, resSeq 23–26, x from col 31); `mdtraj.load` parses the
+  generated topology with no `ValueError`. (The pre-rewrite script was one
+  space short in the atom-name field and every PDB it wrote failed to load.)
+- **Per-replica seeds are collision-free — verified.** Seeds are
+  `10_000 * ARM_OFFSET[arm] + r` with distinct offsets per arm
+  (pilot/E2s/E2m/E2l = 0/1/2/3): 24/24 unique seeds across all arms and
+  replicas. (The old `1000*len(arm)+r` formula collided across all
+  three-character arm names.)
+- **MONITOR_STRIDE 5–10 — verified.** Any positive stride runs: the discard
+  window is recomputed as `ceil(EQ_NS / (2 ns * stride))` with a printed
+  note on slight over-discard, instead of the old assertion that rejected
+  every documented value except 5. Swept 5–10 through `analyze()` on a real
+  DCD: all pass.
 - **Restart semantics — verified.** COSMO treats `md_steps` as a
   *cumulative* target on restart (`nsteps_remain = md_steps − done_steps`),
   confirmed on `2026.2.dev2` both by code inspection and empirically by
