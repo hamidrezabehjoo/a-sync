@@ -15,26 +15,39 @@ aa) per sequence; STARLING's training set ultimately comprised nearly
 12 million distance maps from ~78,000 such simulations. We run, for
 alpha-syn only: pilot (100 ns x1), E2s (6 us x6), E2m (20 us x3),
 E2l (100 us x3, CHAINED SEGMENTS via checkpoint/restart). E2l is ~76%
-of production compute -- do NOT submit it before E2s gates pass.
+of production compute -- do NOT run it before E2s gates pass.
 
 Force-field construction: FINCHES tables spliced into the protein block
 of cosmo's (24,24) arrays by residue 'id'; unit scales auto-detected by
-requiring reproduction of cosmo's built-in mpipi (this install: sigma
-x0.1, eps x4.184). eps transferred as cosmo-bare + (GG - original) from
-FINCHES -- exact at equal salt whether or not FINCHES folds any
-electrostatics into eps, since the common part cancels in the difference.
-rc: cosmo's rc/sigma ratio is EXACTLY 3.0 for mpipi (asserted); the same
-convention is assumed for GG -- VERIFY against Lotthammer 2024 SI. Self-validation: sigma/nu/mu/rc and the FULL 20x20 eps block must
-reproduce cosmo mpipi (<1e-3 rel; FINCHES eps is bare Wang-Frenkel on
-this stack -- mode A). GG deltas saved to mpipi_gg_delta.npz. Units are
-auto-detected, not assumed (installed finches: sigma x0.1, eps x4.184).
+requiring reproduction of cosmo's built-in mpipi (sigma x0.1, eps x4.184
+on tested FINCHES 0.1.3 and 1.0.0). eps transferred as cosmo-bare +
+(GG - original) from FINCHES -- exact at equal salt whether or not
+FINCHES folds any electrostatics into eps, since the common part cancels
+in the difference. rc: cosmo's rc/sigma ratio is EXACTLY 3.0 for mpipi
+(asserted); the same convention is used for GG, corroborated by FINCHES'
+own Wang-Frenkel reference energy (R_ij = 3*sigma_ij hard-coded there);
+still verify against Lotthammer 2024 SI before E2l.
+
+RUNTIME SPLICE (IMPORTANT): COSMO dispatches force terms and per-residue
+atom types by the model NAME and hard-codes 'mpipi' in three places
+(models.py per-residue + nonbonded dispatch, addWangFrenkelForces'
+assert, setCAIDPerResidueType's table lookup). Registering a new model
+name therefore cannot run on unmodified COSMO. Instead, the validated GG
+model entry is serialized to mpipi_gg_params.pkl, and
+run_cosmo_mpipigg.py replaces parameters['mpipi'] with it at run time;
+the INI keeps model = mpipi. Provenance lives in mpipi_gg_delta.npz,
+the runinfo logs, and versions.txt.
 
 RUN ORDER:
-  1. python setup_asyn_mpipigg.py --only pilot ; submit pilot; sanity-check
-  2. python setup_asyn_mpipigg.py --only E2s  ; submit E2s
+  1. python setup_asyn_mpipigg.py --only pilot ; run pilot; sanity-check
+  2. python setup_asyn_mpipigg.py --only E2s  ; run E2s
   3. gates: monitor.py cross-replica spread + block drift (ALBATROSS Rg
      is a SANITY band, not a pass/fail criterion)
-  4. then --only E2m, then E2l (chain segments with restart=yes)
+  4. then --only E2m, then E2l (chained segments, restart=yes)
+
+All runs are plain invocations of `python run_cosmo_mpipigg.py -f <ini>`;
+scheduler integration (arrays, job dependencies) is deliberately left to
+the user's site and is not part of this repo.
 """
 import os, sys, json, platform, subprocess
 
@@ -46,6 +59,8 @@ EQ_STEPS = int(EQ_DISCARD_NS * 1000 / DT_PS)
 EQ_FRAMES = EQ_STEPS // NSTXOUT
 assert EQ_STEPS == 500_000 and EQ_FRAMES == 5
 NSTCHK = 500_000                     # checkpoint every 10 ns (E2l chaining)
+NSTCOMM = 100                        # COM removal every 100 steps (2 ps);
+                                     # our choice -- COSMO default is off
 BOND_A, EV_MIN_A = 3.8, 3.5          # our SAW choice; not from the paper
 ARM_OFFSET = {'pilot': 0, 'E2s': 1, 'E2m': 2, 'E2l': 3}  # distinct seeds per arm
 
@@ -112,10 +127,10 @@ def build_tables(base, finches_d, sigma_scale, eps_scale):
     """Splice FINCHES pair tables into cosmo's (24,24) protein block.
     FINCHES table units are version-dependent; the (sigma, eps) scale pair
     is auto-detected by requiring reproduction of cosmo's built-in mpipi
-    (installed finches 0.1.3: sigma x0.1 [Ang->nm], eps x4.184 [kcal->kJ]).
+    (tested installs: sigma x0.1 [Ang->nm], eps x4.184 [kcal->kJ]).
     eps returned as scaled FINCHES values -- caller applies the delta
     correction against Mpipi_original (exact whether or not FINCHES folds
-    the Debye-Huckel term into eps; see mode A/B print in build_gg_model)."""
+    the Debye-Huckel term into eps; see mode A/B logic in build_gg_model)."""
     import numpy as np
     eps = np.array(base['eps_ij'], dtype=float)
     sig = np.array(base['sigma_ij'], dtype=float)
@@ -166,6 +181,7 @@ def build_gg_model():
         return d / s
 
     best = None
+    mode_b_seen = False
     for ss in (1.0, 0.1):
         for es in (1.0, 4.184):
             o = build_tables(base, orig_d, ss, es)
@@ -179,22 +195,25 @@ def build_gg_model():
                   "  ".join(f"{k} rel={v:.2e}" for k, v in r.items()) +
                   f"  | eps full={r_eps_full:.2e}")
             other = max(r[k] for k in ['sigma_ij', 'nu_ij', 'mu_ij', 'rc_ij'])
-            if other < 1e-3 and r_eps_full < 1e-3:
-                if r_eps_full >= 1e-3 and r_eps_unch < 1e-3:
-                    sys.exit("mode B detected: charged-pair eps does not "
-                             "match cosmo after unit scaling (DH folded "
-                             "into FINCHES eps?). Expected mode A on cosmo. "
-                             "Inspect the charged-pair delta matrix before "
-                             "trusting any splice.")
-                best = ((ss, es), o, "A (bare eps)")
+            if other >= 1e-3:
+                continue                       # wrong unit scales; keep looking
+            if r_eps_full < 1e-3:
+                best = ((ss, es), o)
                 print(f"[2] self-validation passed (sigma x{ss}, eps x{es}); "
                       f"FINCHES eps mode: A (bare eps, full-matrix match).")
                 break
+            if r_eps_unch < 1e-3:
+                mode_b_seen = True             # neutral matches, charged does not
         if best is not None:
             break
     if best is None:
+        if mode_b_seen:
+            sys.exit("mode B detected: charged-pair eps does not match cosmo "
+                     "after unit scaling (DH folded into FINCHES eps?). "
+                     "Expected mode A on cosmo. Inspect the charged-pair "
+                     "delta matrix before trusting any splice.")
         sys.exit("FINCHES Mpipi_original does not reproduce cosmo mpipi. Aborting.")
-    (ss, es), o, mode = best
+    (ss, es), o = best
     base_eps = np.asarray(base['eps_ij'], float)
 
     cn = [(i, j) for i in charged_ids for j in prot if j not in charged_ids]
@@ -210,30 +229,37 @@ def build_gg_model():
     entry = copy.deepcopy(base)
     for k in ['eps_ij', 'sigma_ij', 'nu_ij', 'mu_ij', 'rc_ij']:
         entry[k] = g[k]
-    mp.parameters['mpipi_gg'] = entry
     dl = getattr(mp, 'debye_length', None)
     if not (isinstance(dl, dict) and 'mpipi' in dl):
         sys.exit("cosmo debye_length registry not found -- cannot guarantee "
                  "150 mM; aborting rather than simulating the wrong salt.")
-    dl['mpipi_gg'] = dl['mpipi']
-    print(f"[2] copied debye_length['mpipi']={dl['mpipi']} -> ['mpipi_gg']")
+    print(f"[2] debye_length['mpipi'] = {dl['mpipi']} nm (150 mM); recorded "
+          f"in pkl for a runtime sanity check (no registry edit needed: the "
+          f"INI keeps model = mpipi).")
 
     d = np.abs(g['eps_ij'] - base_eps)
     rows = sorted(range(24), key=lambda k: -float(np.nanmax(d[k, :])))
     inv = {v: k for k, v in id_of.items()}
-    print("[2] registered 'mpipi_gg'. epsilon rows most changed by GG:")
+    print("[2] built Mpipi-GG entry. epsilon rows most changed by GG:")
     for k in rows[:5]:
         print(f"      {inv.get(k, f'idx{k}'):4s}: max|deps| = {np.nanmax(d[k, :]):.4f} kJ/mol")
-    print("[2] ACTION ITEM before E2l: verify rc = 3*sigma for GG against "
-          "Lotthammer 2024 SI (assumption, not validated).")
+    print("[2] NOTE before E2l: rc = 3*sigma for GG is corroborated by "
+          "FINCHES' own Wang-Frenkel energy (R_ij = 3*sigma_ij hard-coded); "
+          "still verify against Lotthammer 2024 SI.")
     import pickle
     with open('mpipi_gg_params.pkl', 'wb') as fh:
-        pickle.dump({'parameters': mp.parameters,
-                     'debye_length': mp.debye_length}, fh)
-    print("[2] saved validated tables to mpipi_gg_params.pkl (wrapper loads "
-          "these; no re-validation on compute nodes)")
-    return mp.parameters
+        pickle.dump({'gg_entry': entry,
+                     'debye_length_mpipi': dl['mpipi'],
+                     'unit_scales': {'sigma': ss, 'eps': es},
+                     'spliced_into': 'mpipi'}, fh)
+    print("[2] saved validated GG entry to mpipi_gg_params.pkl "
+          "(run_cosmo_mpipigg.py splices it into parameters['mpipi'] "
+          "at run time; no re-validation on compute nodes)")
+    return entry
 
+# Ladder design lives here only. NOTE: the pre-cov proposal (Sept 2026)
+# lists E2l as 6 replicas and drops E2m (20 us is a nested prefix of E2l);
+# reconcile this table with the design doc before the campaign.
 ARMS = {'pilot': (0.1, 1), 'E2s': (6, 6), 'E2m': (20, 3), 'E2l': (100, 3)}
 E2L_SEG_US = 10        # E2l runs as explicit 10-us chained segments
 E2L_NSEG = ARMS['E2l'][0] // E2L_SEG_US
@@ -243,13 +269,21 @@ INI = """[OPTIONS]
 # Equilibration = first {eq} ns (frames 1-{eqf}), discarded in analysis.
 # tau_t = Langevin friction coefficient in ps^-1; 0.01 matches the
 # Lotthammer weak-coupling (~100 ps) protocol and COSMO's example.
-# E2l: chain segments -- resubmit with restart=yes after each checkpoint.
+# nstcomm = COM removal every 100 steps (2 ps); our choice (COSMO default
+# is off). Delete the key if your COSMO build predates nstcomm support.
+# model stays 'mpipi' because COSMO dispatches force terms by that name;
+# run_cosmo_mpipigg.py splices the validated Mpipi-GG tables into
+# parameters['mpipi'] at run time (see README).
+# E2l: chain segments -- run seg N after seg N-1 (restart=yes resumes
+# from the shared checkpoint; md_steps is a CUMULATIVE target, verified
+# on COSMO 2026.2.dev2 by probe_restart.py).
 md_steps      = {steps}
 dt            = 0.02
 nstxout       = {nstxout}
 nstchk        = {nstchk}
 nstlog        = 50000
-model         = mpipi_gg
+nstcomm       = {nstcomm}
+model         = mpipi
 tcoupl        = yes
 ref_t         = 300
 tau_t         = 0.01
@@ -262,20 +296,6 @@ outname       = {outname}
 device        = GPU
 restart       = {restart}
 minimize      = yes
-"""
-
-SLURM = """#!/bin/bash
-#SBATCH --job-name=mpipigg_{arm}
-#SBATCH --output=slurm/%x_%A_%a.out
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
-#SBATCH --time=14-00:00:00
-cd $SLURM_SUBMIT_DIR
-mkdir -p slurm
-source $(conda info --base)/etc/profile.d/conda.sh   # conda must be on batch PATH
-conda activate myenv          # <-- adjust if your env name differs
-python run_cosmo_mpipigg.py -f md_{arm}_${{SLURM_ARRAY_TASK_ID}}_seg{seg}.ini
 """
 
 def record_versions():
@@ -326,56 +346,34 @@ def main():
                 eq_ns = EQ_DISCARD_NS if seg == 1 else 0
                 eqf = EQ_FRAMES if seg == 1 else 0
                 # COSMO restart treats md_steps as a CUMULATIVE target:
-                # it runs (md_steps - steps_already_done). So segment N's
-                # md_steps must be the total through segment N, not the
-                # length of segment N.
+                # it runs (md_steps - steps_already_done), verified on
+                # COSMO 2026.2.dev2 both by code inspection and by
+                # probe_restart.py. So segment N's md_steps must be the
+                # total through segment N, not the length of segment N.
                 seg_steps = seg * steps_per_seg + EQ_STEPS
                 restart = 'no' if seg == 1 else 'yes'
                 ini = INI.format(arm=arm, rep=r, eq=eq_ns, eqf=eqf,
                                  steps=seg_steps, nstxout=NSTXOUT,
-                                 nstchk=NSTCHK, pdb=pdb, outdir=outdir,
+                                 nstchk=NSTCHK, nstcomm=NSTCOMM,
+                                 pdb=pdb, outdir=outdir,
                                  outname=f"asyn_{arm}_rep{r}",
                                  restart=restart)
                 with open(f"md_{arm}_{r}_seg{seg}.ini", 'w') as fh:
                     fh.write(ini)
-        seg_list = range(1, E2L_NSEG + 1) if arm == 'E2l' else range(1, 2)
-        for seg in seg_list:
-            name = f"submit_{arm}.slurm" if arm != 'E2l' \
-                   else f"submit_{arm}_seg{seg}.slurm"
-            with open(name, 'w') as fh:
-                fh.write(SLURM.format(arm=arm, seg=seg))
-    with open('run_cosmo_mpipigg.py', 'w') as fh:
-        fh.write(WRAPPER)
     print(f"[3] wrote {sum(n for _, n in arms.values())} replicas "
-          f"across {len(arms)} arm(s); per-replica PDBs, per-arm SLURM files.")
+          f"across {len(arms)} arm(s): per-replica PDBs + per-segment INIs.")
+    print("[3] run with the static repo runner, e.g.:")
     for arm in arms:
+        nrep = ARMS[arm][1]
         if arm == 'E2l':
-            for seg in range(1, E2L_NSEG + 1):
-                print(f"      sbatch --array=1-{ARMS[arm][1]} "
-                      f"submit_{arm}_seg{seg}.slurm   # sequential: seg N "
-                      f"after seg N-1 finishes")
+            print(f"      # {arm}: segments sequential per replica")
+            print(f"      for r in $(seq 1 {nrep}); do for s in $(seq 1 {E2L_NSEG}); do "
+                  f"python run_cosmo_mpipigg.py -f md_{arm}_${{r}}_seg${{s}}.ini; done; done")
         else:
-            print(f"      sbatch --array=1-{ARMS[arm][1]} submit_{arm}.slurm")
+            print(f"      for r in $(seq 1 {nrep}); do "
+                  f"python run_cosmo_mpipigg.py -f md_{arm}_${{r}}_seg1.ini; done")
     print("[3] gates before next arm: monitor.py (cross-replica spread, "
           "block drift; ALBATROSS Rg = sanity band only).")
-
-WRAPPER = """#!/usr/bin/env python
-# cluster-safe runner: load pre-validated tables (fast, quiet), then mdrun
-import sys, pickle
-sys.path.insert(0, '.')
-import cosmo.parameters.model_parameters as mp
-
-with open('mpipi_gg_params.pkl', 'rb') as fh:
-    state = pickle.load(fh)
-mp.parameters.clear(); mp.parameters.update(state['parameters'])
-if isinstance(getattr(mp, 'debye_length', None), dict) and \
-        isinstance(state.get('debye_length'), dict):
-    mp.debye_length.clear(); mp.debye_length.update(state['debye_length'])
-
-from cosmo.mdrun import main as cosmo_main
-sys.argv = ['mdrun'] + sys.argv[1:]
-cosmo_main()
-"""
 
 if __name__ == '__main__':
     main()
