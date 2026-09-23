@@ -153,8 +153,9 @@ mpipi_gg_delta.npz         # GG vs base parameter differences
   space short in the atom-name field and every PDB it wrote failed to load.)
 - **Per-replica seeds are collision-free — verified.** Seeds are
   `10_000 * ARM_OFFSET[arm] + r` with distinct offsets per arm
-  (pilot/E2s/E2m/E2l = 0/1/2/3): 24/24 unique seeds across all arms and
-  replicas. (The old `1000*len(arm)+r` formula collided across all
+  (pilot/E2s/E2m/E2l = 0/1/2/3): all 13 per-replica seeds across the
+  ladder are unique (checked exhaustively for replica indices 1–6 in
+  every arm). (The old `1000*len(arm)+r` formula collided across all
   three-character arm names.)
 - **MONITOR_STRIDE 5–10 — verified.** Any positive stride runs: the discard
   window is recomputed as `ceil(EQ_NS / (2 ns * stride))` with a printed

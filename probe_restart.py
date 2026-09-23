@@ -11,7 +11,7 @@ your own build before launching E2l.
 
 Design: leg 1 runs 60k steps from scratch; leg 2 restarts with
 md_steps = 120k. If md_steps is cumulative the pair yields 12 frames
-(10k-step spacing); if it is per-segment it yields 24.
+(10k-step spacing); if it is per-segment it yields 18.
 
 Usage:
     python probe_restart.py md_pilot_1_seg1.ini
@@ -26,6 +26,9 @@ EXPECTED = {'cumulative': (LEG2_STEPS) // NSTXOUT,
             'per-segment': (LEG1_STEPS + LEG2_STEPS) // NSTXOUT}
 
 def _set(ini, key, value):
+    if not re.search(rf'^{key}\s*=', ini, flags=re.M):
+        sys.exit(f'[probe] key "{key}" not found in base INI -- '
+                 f'template drift; refusing to continue')
     return re.sub(rf'^{key}\s*=.*$', f'{key} = {value}', ini,
                   count=1, flags=re.M)
 
@@ -52,6 +55,9 @@ def main(base_ini):
             sys.exit(f'[probe] {path} failed (exit {r.returncode})')
     import glob
     pdb = glob.glob('pilot/rep*/*.pdb') or glob.glob('*/rep*/*.pdb')
+    if not pdb:
+        sys.exit('[probe] no topology PDB found (looked in pilot/rep*/ '
+                 'and */rep*/); run an arm setup first')
     import mdtraj as md
     t = md.load('probe/probe.dcd', top=pdb[0])
     n = t.n_frames

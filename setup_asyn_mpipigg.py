@@ -176,6 +176,8 @@ def build_gg_model():
     def relmax(new, ref, pairs=None):
         if pairs is None:
             return float(np.nanmax(np.abs(new - ref))) / (float(np.nanmax(np.abs(ref))) or 1.0)
+        if not pairs:
+            return 0.0                     # no neutral pairs: nothing to check
         d = max(abs(new[i, j] - ref[i, j]) for i, j in pairs)
         s = max(abs(ref[i, j]) for i, j in pairs) or 1.0
         return d / s
