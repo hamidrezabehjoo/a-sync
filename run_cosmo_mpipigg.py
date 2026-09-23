@@ -18,7 +18,24 @@ mpipi_gg_delta.npz, the runinfo logs, and versions.txt.
 
 Usage:  python run_cosmo_mpipigg.py -f md_E2s_1_seg1.ini
 """
-import sys, pickle
+import sys, os, pickle
+
+# --- pre-flight: fail loudly on missing/malformed INI ------------------
+# configparser.read() silently accepts a nonexistent file, so COSMO's
+# config['OPTIONS'] then dies with a cryptic KeyError. Catch it here.
+_ini = None
+for i, a in enumerate(sys.argv[1:], 1):
+    if a in ('-f', '--file') and i + 1 < len(sys.argv):
+        _ini = sys.argv[i + 1]
+if _ini is not None:
+    if not os.path.isfile(_ini):
+        sys.exit(f"[wrapper] INI not found: {_ini}\n"
+                 f"  (did setup_asyn_mpipigg.py --only <that arm> run on "
+                 f"this machine? ls md_*_seg*.ini)")
+    with open(_ini) as _fh:
+        if '[OPTIONS]' not in _fh.read():
+            sys.exit(f"[wrapper] {_ini} has no [OPTIONS] section -- stale "
+                     f"or foreign INI; regenerate with setup_asyn_mpipigg.py")
 
 sys.path.insert(0, '.')
 import cosmo.parameters.model_parameters as mp
